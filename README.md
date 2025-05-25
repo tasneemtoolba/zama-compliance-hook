@@ -1,6 +1,6 @@
 # Zama Compliance Hook for Uniswap v4
 
-![Zama Compliance Hook](https://i.imgur.com/placeholder.png)
+![Zama Compliance Hook](fhe-hook.webp)
 
 ## 🌟 Vision
 
