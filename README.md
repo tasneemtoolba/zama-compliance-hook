@@ -28,25 +28,19 @@ Our architecture follows a modular approach with clear separation of concerns, e
 
 ```
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│  User Registry │────▶│  Rules Engine  │◀────│    Product  │
-└───────┬───────┘     └───────┬───────┘     └───────┬───────┘
+│  User Registry│────▶│  Rules Engine │◀─── │    Product    │
+└───────┬───────┘     └───────────────┘     └───────┬───────┘
+        │                     ▲                     │
         │                     │                     │
-        │                     │                     │
-        │             ┌───────────────┐             │
-        │             │ Rule Factory  │             │
-        │             └───────┬───────┘             │
-        │                     │                     │
-        │                     ▼                     │
-        │             ┌───────────────┐             │
+        │             ┌───────┴───────┐             │
         └────────────▶│     Rules     │◀────────────┘
-                      └───────┬───────┘
+                      └───────────────┘
+                              ▲
                               │
-                              ▼
-                      ┌───────────────┐
+                      ┌───────┴───────┐
                       │   Conditions  │
                       └───────────────┘
 ```
-
 ### User Registry
 A smart contract that handles dynamic key-value storage with roles, using a Hierarchical Mapping Pattern combined with Role-Based Access Control.
 
