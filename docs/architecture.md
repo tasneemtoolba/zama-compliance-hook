@@ -20,15 +20,17 @@ This second part dives into the technical implementation using:
 
 ### Compliance Expert
 - Creates and publishes regulatory rules per jurisdiction
-- Encodes them as condition bitmaps (`uint256`)
+- Defines rule-specific bitmaps and their corresponding condition arrays
 - Assigns rules to tokenized assets (Products)
 
 ### Investor (User)
 - Completes off-chain KYC/AML with a licensed verifier
 - Verifier encrypts and hashes the compliance profile using **Zama FHE**
 - **Only the FHE-encrypted hash** is stored on-chain in the User Registry
+- The investor can exit his investment position by swapping his RWA tokens with Circle 
 
 ---
+
 ## 💡 Why USD Redemption Matters
 
 One major limitation of traditional RWA platforms is slow, manual fiat redemptions — often taking days or even weeks.
@@ -55,16 +57,6 @@ One major limitation of traditional RWA platforms is slow, manual fiat redemptio
 
 ---
 
-## 🧠 Architecture Highlights
-
-- **Rules** define compliance via bitmaps (age, jurisdiction, AML, etc.)
-- **Products** list the rules required for eligibility
-- **Users** upload FHE-hashed compliance proofs
-- **Hooks** can enforce these rules before allowing trades or redemptions
-- **Circle/Fiat Bridge** performs atomic issuance of USDC after compliance pass
-
----
-
 ## 🔁 System Architecture
 
 
@@ -86,6 +78,55 @@ One major limitation of traditional RWA platforms is slow, manual fiat redemptio
 
 ---
 
+## 🧠 Architecture Highlights
+
+- **Rules** define compliance via bitmaps (age, jurisdiction, AML, etc.)
+- **Products** list the rules required for eligibility
+- **Users** upload FHE-hashed compliance proofs
+- **Hooks** can enforce these rules before allowing trades or redemptions
+- **Circle/Fiat Bridge** performs atomic issuance of USDC after compliance pass
+
+---
+
+## 🧠 Example: Bitmap Encoding (For Illustration Only)
+
+### Rule Bitmap Structure
+Each rule's bitmap is organized into specific ranges of bits, each representing different compliance attributes. Here's an example structure:
+
+| Bits       | Condition Description                      |
+|------------|---------------------------------------------|
+| 0–255      | Nationality (256 possible countries)        |
+| 256        | KYC Status (1 = verified)                   |
+| 257        | Sanction Check (1 = cleared)                |
+| 258-261    | Tax Requirements (4 types)                  |
+| 262-269    | License Type (8 types)                      |
+
+### Condition Array
+The condition array defines how to traverse through the rule's bitmap:
+
+```solidity
+// Conditions Array - defines how to traverse the bitmap
+conditionsArray[0] = 2^8  // Check nationality bits (0-255)
+conditionsArray[1] = 2^1  // Check KYC status (bit 256)
+conditionsArray[2] = 2^1  // Check sanction status (bit 257)
+conditionsArray[3] = 2^2  // Check tax requirements (bits 258-261)
+conditionsArray[4] = 2^3  // Check license type (bits 262-269)
+```
+
+### Traversal Flow
+1. Start with `conditionsArray[0]` - check nationality bits to identify investor's country
+2. Move to `conditionsArray[1]` - verify KYC status
+3. Move to `conditionsArray[2]` - check sanction status
+4. Move to `conditionsArray[3]` - verify tax compliance
+5. Finally check `conditionsArray[4]` - verify license type
+
+This structure provides:
+- **Rule-specific**: Each rule maintains its own bitmap with relevant compliance data
+- **Efficient traversal**: Direct bit manipulation for fast lookups within the rule's bitmap
+- **Flexible logic**: Tree structure allows complex conditional flows per rule
+
+---
+
 ## 🔐 Compliance with FHE Hashing
 
 - Users never store raw compliance data on-chain.
@@ -95,26 +136,15 @@ One major limitation of traditional RWA platforms is slow, manual fiat redemptio
 
 ---
 
-## 🧠 Example: Bitmap Encoding (For Illustration Only)
-
-| Bits       | Condition Description                      |
-|------------|---------------------------------------------|
-| 0–3        | Nationality (e.g., Egyptian = 0001)         |
-| 4          | Age > 18 (1 = true)                         |
-| 5–6        | AML recency (e.g., 01 = <6 months)          |
-| 7          | Investor Accreditation                     |
-| 8–12       | National ID Checksum                        |
-| 13–15      | Jurisdiction (e.g., 101 = MENA)             |
-
----
-
 ## 💾 Solidity Interfaces
 
 ### `IRule.sol`
 
 ```solidity
 interface IRule {
-    function getConditionBitmap() external view returns (uint256);
+    function getRuleBitmap() external view returns (uint256);
+    function getConditionsArray() external view returns (uint256[] memory);
+    function evaluateCondition(uint256 conditionIndex, uint256 userBitmap) external view returns (bool);
 }
 ```
 
@@ -124,6 +154,7 @@ interface IRule {
 interface IProduct {
     function getRuleAddresses() external view returns (address[] memory);
     function addRule(address ruleAddress) external;
+    function removeRule(address ruleAddress) external;
 }
 ```
 
@@ -131,7 +162,8 @@ interface IProduct {
 
 ```solidity
 interface IRulesEngine {
-    function isCompliant(address user, address product) external view returns (bool);
+    function isCompliant(bytes32 userId, bytes32 productId) external view returns (bool);
+    function evaluateRule(address ruleAddress, bytes32 userId) external view returns (bool);
 }
 ```
 
@@ -139,9 +171,25 @@ interface IRulesEngine {
 
 ```solidity
 interface IFHEVerifier {
-    function verifyUserAgainstRules(bytes calldata encryptedUserHash, uint256[] calldata ruleBitmaps) external view returns (bool);
+    function verifyUserAgainstRule(
+        bytes32 calldata encryptedUserHash,
+        uint256 ruleBitmap,
+        uint256[] calldata conditionsArray
+    ) external view returns (bool);
 }
 ```
+
+### `IUserRegistry.sol`
+
+```solidity
+interface IUserRegistry {
+    function addUser(bytes32 userId, address wallet, bytes32 encryptedProfileBitMap) external;
+    function addNewWallet(bytes32 userId, address wallet) external;
+    function addNewProfileData(bytes32 userId, bytes32 encryptedProfileBitMap) external;
+    function getEncryptedFHEHash(bytes32 userId) external view returns (bytes32);
+}
+```
+---
 
 ## 🛠 RulesEngine Contract Example
 
@@ -155,21 +203,31 @@ contract RulesEngine is IRulesEngine {
         verifier = IFHEVerifier(_verifier);
     }
 
-    function isCompliant(address user, address product) public view override returns (bool) {
-        address[] memory ruleAddresses = IProduct(product).getRuleAddresses();
-        uint256[] memory ruleBitmaps = new uint256[](ruleAddresses.length);
-
+    function isCompliant(bytes32 userId, bytes32 productId) public view override returns (bool) {
+        address[] memory ruleAddresses = IProduct(productId).getRuleAddresses();
+        
         for (uint i = 0; i < ruleAddresses.length; i++) {
-            ruleBitmaps[i] = IRule(ruleAddresses[i]).getConditionBitmap();
+            if (!evaluateRule(ruleAddresses[i], userId)) {
+                return false;
+            }
         }
+        return true;
+    }
 
-        bytes memory encryptedUserHash = registry.getEncryptedFHEHash(user);
-
-        return verifier.verifyUserAgainstRules(encryptedUserHash, ruleBitmaps);
+    function evaluateRule(address ruleAddress, bytes32 userId) public view override returns (bool) {
+        IRule rule = IRule(ruleAddress);
+        bytes32 encryptedUserHash = registry.getEncryptedFHEHash(userId);
+        
+        return verifier.verifyUserAgainstRule(
+            encryptedUserHash,
+            rule.getRuleBitmap(),
+            rule.getConditionsArray()
+        );
     }
 }
-
 ```
+
+---
 
 ## 🧪 Zama Verifier Pseudocode
 
@@ -205,7 +263,7 @@ fn verify_user_against_rules(encrypted_hash: EncryptedBits, rules: Vec<PlainBits
 2. Off-chain verifier checks user eligibility via FHE
 3. If approved:
    - RWA tokens are **burned**
-   - USDC is **minted atomically** to the user’s wallet via Circle
+   - USDC is **minted atomically** to the user's wallet via Circle
 
 This atomic process ensures that privacy and compliance are enforced **without delay or manual review**.
 
@@ -225,10 +283,10 @@ This atomic process ensures that privacy and compliance are enforced **without d
 
 ## 🔜 Coming in Part 3...
 
-We’ll implement:
+We'll implement:
 
 - The Hook logic inside Uniswap v4  
-- Foundry-based testing with simulated verifiers  
+- Hardhat-based testing with simulated verifiers  
 - USD redemption module  
 - Frontend flow for redemption + real-world wallet UX
 
@@ -243,6 +301,6 @@ If you're building in:
 - Privacy-preserving infrastructure  
 - Fiat bridges or stablecoin protocols  
 
-We’d love to collaborate and exchange ideas. Let’s build compliant, user-first DeFi — together.
+We'd love to collaborate and exchange ideas. Let's build compliant, user-first DeFi — together.
 
 ---
