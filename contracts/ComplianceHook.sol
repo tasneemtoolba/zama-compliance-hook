@@ -1,82 +1,183 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {SwapParams} from "v4-core/types/PoolOperation.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {PoolId} from "v4-core/types/PoolId.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {Currency} from "v4-core/types/Currency.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {IFHEVerifier} from "./interfaces/IFHEVerifier.sol";
+import {IUserRegistry} from "./interfaces/IUserRegistry.sol";
 
-/**
- * @title ComplianceHook
- * @dev Main contract for managing compliance checks and FHE operations
- */
-contract ComplianceHook is Ownable, ReentrancyGuard {
-    // Struct to store compliance check results
-    struct ComplianceResult {
-        bool isCompliant;
-        string reason;
-        uint256 timestamp;
-    }
+contract ComplianceHook is BaseHook {
+    using StateLibrary for IPoolManager;
 
-    // Mapping to store compliance results for each transaction
-    mapping(bytes32 => ComplianceResult) public complianceResults;
+    // FHE Verifier and User Registry contracts
+    IFHEVerifier public immutable fheVerifier;
+    IUserRegistry public immutable userRegistry;
+
+    // Mapping to store rule configurations for each pool
+    mapping(PoolId => bytes32) public poolRules;
 
     // Events
-    event ComplianceCheckRequested(bytes32 indexed transactionId, address indexed requester);
-    event ComplianceResultRecorded(bytes32 indexed transactionId, bool isCompliant, string reason);
+    event ComplianceCheckPassed(address indexed user, PoolId indexed poolId);
+    event ComplianceCheckFailed(
+        address indexed user,
+        PoolId indexed poolId,
+        string reason
+    );
+    event PoolRuleSet(PoolId indexed poolId, bytes32 ruleId);
 
-    constructor() Ownable(msg.sender) {}
+    // Errors
+    error ComplianceCheckFailed();
+    error UserNotRegistered();
+    error RuleNotConfigured();
+    error Unauthorized();
 
-    /**
-     * @dev Request a compliance check for a transaction
-     * @param transactionId Unique identifier for the transaction
-     * @param encryptedData Encrypted data for compliance check
-     */
-    function requestComplianceCheck(bytes32 transactionId, bytes calldata encryptedData) 
-        external 
-        nonReentrant 
+    // Constructor
+    constructor(
+        IPoolManager _manager,
+        IFHEVerifier _fheVerifier,
+        IUserRegistry _userRegistry
+    ) BaseHook(_manager) {
+        fheVerifier = _fheVerifier;
+        userRegistry = _userRegistry;
+    }
+
+    // BaseHook Functions
+    function getHookPermissions()
+        public
+        pure
+        override
+        returns (Hooks.Permissions memory)
     {
-        require(transactionId != bytes32(0), "Invalid transaction ID");
-        require(encryptedData.length > 0, "Empty encrypted data");
-
-        emit ComplianceCheckRequested(transactionId, msg.sender);
+        return
+            Hooks.Permissions({
+                beforeInitialize: false,
+                afterInitialize: false,
+                beforeAddLiquidity: false,
+                afterAddLiquidity: false,
+                beforeRemoveLiquidity: false,
+                afterRemoveLiquidity: false,
+                beforeSwap: true, // We want to check before swap
+                afterSwap: false,
+                beforeDonate: false,
+                afterDonate: false,
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: false,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
+            });
     }
 
-    /**
-     * @dev Record the result of a compliance check
-     * @param transactionId Unique identifier for the transaction
-     * @param isCompliant Whether the transaction is compliant
-     * @param reason Reason for the compliance decision
-     */
-    function recordComplianceResult(
-        bytes32 transactionId,
-        bool isCompliant,
-        string calldata reason
-    ) external onlyOwner nonReentrant {
-        require(transactionId != bytes32(0), "Invalid transaction ID");
-        require(complianceResults[transactionId].timestamp == 0, "Result already recorded");
+    function _beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata
+    ) internal override returns (bytes4, int128) {
+        // Skip compliance check if the swap is from this contract
+        if (sender == address(this)) {
+            return (this.beforeSwap.selector, 0);
+        }
 
-        complianceResults[transactionId] = ComplianceResult({
-            isCompliant: isCompliant,
-            reason: reason,
-            timestamp: block.timestamp
-        });
+        // Get the rule ID for this pool
+        bytes32 ruleId = poolRules[key.toId()];
+        if (ruleId == bytes32(0)) {
+            revert RuleNotConfigured();
+        }
 
-        emit ComplianceResultRecorded(transactionId, isCompliant, reason);
+        // Get the user's ID from the registry
+        bytes32 userId;
+        try userRegistry.getUserIdByWallet(sender) {
+            userId = userRegistry.getUserIdByWallet(sender);
+        } catch {
+            revert UserNotRegistered();
+        }
+
+        // Get the user's encrypted profile data
+        bytes32 encryptedUserHash = userRegistry.getEncryptedFHEHash(userId);
+
+        // Perform FHE compliance check
+        bool isCompliant = fheVerifier.verifyUserAgainstRule(
+            encryptedUserHash,
+            uint256(ruleId), // Using ruleId as the bitmap
+            new uint256[](0) // Empty conditions array for now
+        );
+
+        if (!isCompliant) {
+            emit ComplianceCheckFailed(
+                sender,
+                key.toId(),
+                "User failed compliance verification"
+            );
+            revert ComplianceCheckFailed();
+        }
+
+        emit ComplianceCheckPassed(sender, key.toId());
+        return (this.beforeSwap.selector, 0);
     }
 
-    /**
-     * @dev Get the compliance result for a transaction
-     * @param transactionId Unique identifier for the transaction
-     * @return isCompliant Whether the transaction is compliant
-     * @return reason Reason for the compliance decision
-     * @return timestamp When the result was recorded
-     */
-    function getComplianceResult(bytes32 transactionId)
-        external
-        view
-        returns (bool isCompliant, string memory reason, uint256 timestamp)
-    {
-        ComplianceResult memory result = complianceResults[transactionId];
-        require(result.timestamp != 0, "No result found");
-        return (result.isCompliant, result.reason, result.timestamp);
+    // Admin Functions
+    function setPoolRule(PoolId poolId, bytes32 ruleId) external {
+        // Only allow the hook owner to set rules
+        // This could be extended to allow pool creators or other authorized parties
+        if (msg.sender != owner()) {
+            revert Unauthorized();
+        }
+
+        poolRules[poolId] = ruleId;
+        emit PoolRuleSet(poolId, ruleId);
     }
-} 
+
+    function setPoolRuleByKey(PoolKey calldata key, bytes32 ruleId) external {
+        setPoolRule(key.toId(), ruleId);
+    }
+
+    // View Functions
+    function getPoolRule(PoolId poolId) external view returns (bytes32) {
+        return poolRules[poolId];
+    }
+
+    function getPoolRuleByKey(
+        PoolKey calldata key
+    ) external view returns (bytes32) {
+        return poolRules[key.toId()];
+    }
+
+    function checkUserCompliance(
+        address user,
+        PoolId poolId
+    ) external view returns (bool) {
+        bytes32 ruleId = poolRules[poolId];
+        if (ruleId == bytes32(0)) {
+            return false;
+        }
+
+        try userRegistry.getUserIdByWallet(user) returns (bytes32 userId) {
+            bytes32 encryptedUserHash = userRegistry.getEncryptedFHEHash(
+                userId
+            );
+            return
+                fheVerifier.verifyUserAgainstRule(
+                    encryptedUserHash,
+                    uint256(ruleId),
+                    new uint256[](0)
+                );
+        } catch {
+            return false;
+        }
+    }
+
+    function checkUserComplianceByKey(
+        address user,
+        PoolKey calldata key
+    ) external view returns (bool) {
+        return checkUserCompliance(user, key.toId());
+    }
+}
